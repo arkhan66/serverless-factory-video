@@ -432,6 +432,16 @@ _USED_URLS_LOCK = threading.Lock()
 # two independent providers in parallel avoids serial 12-second stalls while
 # still giving each provider enough time for normal network conditions.
 _STOCK_API_TIMEOUT = (3, 5)
+# Media DOWNLOAD limits. requests' timeout only bounds the connect handshake
+# and the gap between received chunks; it does NOT cap total transfer time. A
+# server that trickles one byte just under the read-timeout keeps iter_content
+# alive indefinitely, which previously froze the whole job at 0% CPU/GPU while
+# a worker thread blocked on a dead-slow socket. These two limits bound the
+# worst case: a hard wall-clock deadline for the entire download, and a size
+# ceiling so a mislabeled huge file cannot stall the pipeline either.
+_CLIP_DOWNLOAD_CONNECT_READ_TIMEOUT = (5, 15)  # (connect, read-between-chunks)
+_CLIP_DOWNLOAD_MAX_SECONDS = 45                # hard wall-clock cap per file
+_CLIP_DOWNLOAD_MAX_BYTES = 120 * 1024 * 1024   # 120 MB ceiling per clip
 # Five sentence-aligned stock-query options generated in one unified Groq call.
 # Each entry is [primary, backup_1, backup_2, backup_3, backup_4].
 AI_QUERY_OPTIONS = []
@@ -1598,6 +1608,55 @@ def _search_stock_urls(query, page, orientation, limit=None):
     return urls
 
 
+def _download_clip_to_file(url, dest_path):
+    """Download `url` to `dest_path` with a hard wall-clock deadline.
+
+    Returns True on success, False on any failure (timeout, deadline exceeded,
+    size ceiling exceeded, network error). On failure the partial file is
+    removed. This is the single choke point that guarantees no clip download
+    can hang the pipeline: even if the connect/read timeout never trips because
+    a server trickles bytes, the elapsed-time check aborts the transfer.
+    """
+    started = time.perf_counter()
+    bytes_written = 0
+    response = None
+    try:
+        response = requests.get(
+            url, timeout=_CLIP_DOWNLOAD_CONNECT_READ_TIMEOUT, stream=True
+        )
+        with open(dest_path, "wb") as f:
+            for chunk in response.iter_content(8192):
+                if not chunk:
+                    continue
+                # Hard wall-clock cap: a slow-trickle server never trips the
+                # per-chunk read timeout, so bound the whole transfer here.
+                if time.perf_counter() - started > _CLIP_DOWNLOAD_MAX_SECONDS:
+                    raise TimeoutError(
+                        f"download exceeded {_CLIP_DOWNLOAD_MAX_SECONDS}s wall-clock cap"
+                    )
+                f.write(chunk)
+                bytes_written += len(chunk)
+                if bytes_written > _CLIP_DOWNLOAD_MAX_BYTES:
+                    raise OSError(
+                        f"download exceeded {_CLIP_DOWNLOAD_MAX_BYTES} byte ceiling"
+                    )
+        return True
+    except Exception as e:
+        print(f"    Clip download aborted ({type(e).__name__}: {str(e)[:100]})")
+        try:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+        except OSError:
+            pass
+        return False
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
 def search_and_download_vertical(query, idx, duration, tag="", verify=True, normalize=True, page=1):
     """
     Same as search_and_download but requests portrait/vertical source video
@@ -1613,10 +1672,8 @@ def search_and_download_vertical(query, idx, duration, tag="", verify=True, norm
         try:
             raw = TEMP_DIR / f"raw_s{tag}_{idx}.mp4"
             out = TEMP_DIR / f"clip_s{tag}_{idx}.mp4"
-            r = requests.get(url, timeout=25, stream=True)
-            with open(raw,"wb") as f:
-                for chunk in r.iter_content(8192):
-                    if chunk: f.write(chunk)
+            if not _download_clip_to_file(url, raw):
+                continue
             if os.path.getsize(raw) < 5000:
                 try: os.remove(raw)
                 except OSError: pass
@@ -1977,24 +2034,41 @@ def render_short(short_idx, sentences_slice, audio_path, ass_path, logo_path, ou
     # from accumulating and later producing a long concatenated chunk.
     print(f"  Short {short_idx+1}: streaming verified clips directly into normalized output...")
     completed = 0
+    # Same hard phase ceiling as the landscape path: a wedged worker must not
+    # freeze the whole job. Unfinished clips are abandoned and left as None,
+    # which the short's own missing-clip handling tolerates.
+    _short_phase_timeout = max(
+        300, n * _CLIP_QUERY_ROUNDS * (_CLIP_DOWNLOAD_MAX_SECONDS + 60)
+    )
+    _short_phase_started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
         futures = {
             ex.submit(process_short_clip, (i, sent, tag)): i
             for i, sent in enumerate(sentences_slice)
         }
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                i, clip = future.result()
-            except Exception as e:
-                # A single failed sentence must never abort the whole short
-                # (or, previously, every remaining short in the pipeline).
-                i = futures[future]
-                clip = None
-                print(f"    Short {short_idx+1}: clip {i} worker failed "
-                      f"({type(e).__name__}: {str(e)[:160]})")
-            clips[i] = clip
-            completed += 1
-            print(f"    Short {short_idx+1}: completed {completed}/{n} clips")
+        try:
+            for future in concurrent.futures.as_completed(
+                futures, timeout=_short_phase_timeout
+            ):
+                try:
+                    i, clip = future.result()
+                except Exception as e:
+                    # A single failed sentence must never abort the whole short
+                    # (or, previously, every remaining short in the pipeline).
+                    i = futures[future]
+                    clip = None
+                    print(f"    Short {short_idx+1}: clip {i} worker failed "
+                          f"({type(e).__name__}: {str(e)[:160]})")
+                clips[i] = clip
+                completed += 1
+                print(f"    Short {short_idx+1}: completed {completed}/{n} clips")
+        except concurrent.futures.TimeoutError:
+            stuck = [idx for fut, idx in futures.items() if not fut.done()]
+            elapsed = time.perf_counter() - _short_phase_started
+            print(f"    Short {short_idx+1}: clip search hit {_short_phase_timeout}s "
+                  f"deadline after {elapsed:.0f}s; abandoning {len(stuck)} clip(s): {stuck}")
+            for fut in futures:
+                fut.cancel()
 
     if release_verifier:
         _release_llava_for_encoding()
@@ -3264,10 +3338,8 @@ def search_and_download(query, idx, duration, verify=True, page=1):
             raw = TEMP_DIR / f"raw_{idx}.mp4"
             out = TEMP_DIR / f"clip_{idx}.mp4"
             download_started = time.perf_counter()
-            r = requests.get(url, timeout=25, stream=True)
-            with open(raw,"wb") as f:
-                for chunk in r.iter_content(8192):
-                    if chunk: f.write(chunk)
+            if not _download_clip_to_file(url, raw):
+                continue
             download_seconds = time.perf_counter() - download_started
             if os.path.getsize(raw) < 5000:
                 try: os.remove(raw)
@@ -3338,24 +3410,47 @@ def render_video(sentences, audio_path, ass_path, logo_path, out_sub, keep_verif
 
     completed = 0
     update_status(55, f"Finding exact verified clips (0/{n})...")
+    # Hard ceiling for the entire landscape clip-search phase. Workers already
+    # bound their own downloads and ffmpeg subprocesses, but as_completed with
+    # no timeout turns a single wedged worker (e.g. a stuck native call) into a
+    # permanent job freeze at 0% CPU/GPU. Any future still unfinished when this
+    # deadline passes is abandoned and treated as a missing clip, which the
+    # neighbor-substitution path below already recovers from.
+    _CLIP_PHASE_TIMEOUT_SECONDS = max(
+        600, n * _CLIP_QUERY_ROUNDS * (_CLIP_DOWNLOAD_MAX_SECONDS + 60)
+    )
+    _phase_started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
         futures = {
             ex.submit(process_landscape_clip, (i, sent, None)): i
             for i, sent in enumerate(sentences)
         }
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                i, clip = future.result()
-                clips[i] = clip
-            except Exception as e:
-                i = futures[future]
-                print(f"  Clip {i} worker failed: {type(e).__name__}: {str(e)[:160]}")
-                clips[i] = None
-            completed += 1
-            update_status(
-                55 + int((completed / max(1, n)) * 25),
-                f"Exact clips verified and normalized ({completed}/{n})...",
-            )
+        try:
+            for future in concurrent.futures.as_completed(
+                futures, timeout=_CLIP_PHASE_TIMEOUT_SECONDS
+            ):
+                try:
+                    i, clip = future.result()
+                    clips[i] = clip
+                except Exception as e:
+                    i = futures[future]
+                    print(f"  Clip {i} worker failed: {type(e).__name__}: {str(e)[:160]}")
+                    clips[i] = None
+                completed += 1
+                update_status(
+                    55 + int((completed / max(1, n)) * 25),
+                    f"Exact clips verified and normalized ({completed}/{n})...",
+                )
+        except concurrent.futures.TimeoutError:
+            # One or more workers never returned within the phase deadline.
+            # Cancel what we can, log which clips were left unfinished, and let
+            # the missing-clip recovery below substitute neighbors for them.
+            stuck = [idx for fut, idx in futures.items() if not fut.done()]
+            elapsed = time.perf_counter() - _phase_started
+            print(f"  Clip search phase hit {_CLIP_PHASE_TIMEOUT_SECONDS}s deadline "
+                  f"after {elapsed:.0f}s; abandoning {len(stuck)} unfinished clip(s): {stuck}")
+            for fut in futures:
+                fut.cancel()
 
     # Register verified clips BEFORE neighbor substitution so the Shorts
     # rescue pool only contains clips verified for their own sentence.
