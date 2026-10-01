@@ -1,1 +1,1 @@
-{"progress": 48, "message": "Transcribing...", "status": "processing", "logs": "[17:16:40] Starting...\n[17:16:43] Script...\n[17:16:44] Audio...\n[17:18:36] TTS 5/6\n[17:18:37] TTS 6/6\n[17:19:30] Transcribing...", "timestamp": 1790875170.981101}
+{"progress": 50, "message": "Matching visuals to sentences...", "status": "processing", "logs": "[17:16:40] Starting...\n[17:16:43] Script...\n[17:16:44] Audio...\n[17:18:36] TTS 5/6\n[17:18:37] TTS 6/6\n[17:19:30] Transcribing...\n[17:19:38] Matching visuals to sentences...", "timestamp": 1790875178.928682}
