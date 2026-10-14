@@ -3466,15 +3466,36 @@ def render_video(sentences, audio_path, ass_path, logo_path, out_sub, keep_verif
     missing = [i for i, clip in enumerate(clips)
                if not clip or not os.path.exists(clip)]
     if missing:
-        # Allow neighbor substitution for up to 25% missing clips instead of
-        # aborting entirely. Each missing position borrows the nearest verified
-        # neighbor — this keeps the video length correct while only duplicating
-        # a small fraction of visuals. Still FATAL if more than 25% failed.
-        max_allowed_missing = max(3, int(n * 0.25))
-        if len(missing) > max_allowed_missing:
-            print(f"  FATAL: {len(missing)} clips were not verified/normalized "
-                  f"(>{max_allowed_missing} limit): {missing[:20]}; aborting")
+        # Each missing position borrows the nearest verified neighbor clip.
+        # This keeps the video length EXACTLY correct and only duplicates a
+        # fraction of visuals. A substituted clip is still a MiniCPM-verified
+        # clip (just verified for an adjacent sentence of the same script),
+        # so this never introduces an unsafe/unverified visual - it is the
+        # same guarantee the Shorts "reuse a verified long-video clip" tier
+        # already relies on.
+        #
+        # Longer videos (30-35 min => ~230 sentences) legitimately contain
+        # more abstract/metaphorical sentences ("defended hope icon",
+        # "secure future lock") for which no literal stock clip ever passes
+        # verification across all query rounds. Those sentences MUST fall back
+        # to a verified neighbor rather than failing the whole render. We only
+        # abort when the failure is clearly systemic (the vast majority of
+        # clips failed, e.g. no API access / verifier down) - in that case a
+        # mostly-duplicated video would be worthless anyway.
+        verified_count = n - len(missing)
+        systemic_failure_limit = max(3, int(n * 0.60))
+        if verified_count == 0:
+            print(f"  FATAL: no clips were verified at all ({len(missing)}/{n} missing); "
+                  f"nothing to substitute from; aborting")
             return False
+        if len(missing) > systemic_failure_limit:
+            print(f"  FATAL: {len(missing)}/{n} clips failed verification "
+                  f"(> {systemic_failure_limit} systemic-failure limit): {missing[:20]}; "
+                  f"this indicates a broken verifier or provider, aborting")
+            return False
+        if len(missing) > max(3, int(n * 0.25)):
+            print(f"  NOTICE: {len(missing)}/{n} clips unverified (above the usual 25% band) - "
+                  f"recovering via verified-neighbor substitution rather than failing the render")
         print(f"  WARNING: {len(missing)} clips missing; substituting nearest verified neighbor "
               f"for positions {missing[:20]}")
         for mi in missing:
@@ -3491,6 +3512,8 @@ def render_video(sentences, audio_path, ass_path, logo_path, out_sub, keep_verif
                 clips[mi] = clips[best]
                 print(f"    Clip {mi} <- neighbor {best}")
             else:
+                # Unreachable in practice: verified_count > 0 was asserted
+                # above, so at least one valid clip always exists to borrow.
                 print(f"    Clip {mi}: no neighbor available; aborting")
                 return False
     
